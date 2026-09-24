@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Clone and build OpenFHE v1.1.2
-RUN git clone --branch v1.1.2 --depth 1 https://github.com/openfhe-development/openfhe-development.git && \
+RUN git clone --branch v1.1.2 --depth 1 https://github.com/openfheorg/openfhe-development.git && \
     cd openfhe-development && \
     mkdir build && cd build && \
     cmake .. && \

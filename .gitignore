@@ -1,0 +1,10 @@
+# build output
+build/
+# no real cohort files in the repository, only the synthetic example
+data/*.csv
+!data/example_cohort.csv
+!data/points1d.csv
+results_*.txt
+logs/
+benchmark.out
+.DS_Store
