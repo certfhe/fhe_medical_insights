@@ -1,17 +1,38 @@
+// Single-party FHE version of the three tests (no threshold decryption), with the
+// same masked release as mpc-statistics. This is the "1-party (FHE)" row of the
+// tables in the paper.
+//
+// Usage:
+//   statistics-test [--n N] [--runs R] [--csv FILE] [--no-wilcoxon] [--bootstrap] [--verbose]
+//                   [--depth D] [--intbits I] [--decbits F]
+//                   [--chi2-depth E] [--chi2-intbits I] [--chi2-decbits F]
+//                   [--compare-depth C] [--rank-intbits I] [--rank-decbits F]
+//
+// The contexts are the same as in mpc-statistics, so that the FHE and THE rows only
+// differ by the threshold part. The ranking context has depth C + 4 here (no
+// interactive bootstrapping); --bootstrap uses normal CKKS bootstrapping instead.
+
 #include "utils-basics.h"
 #include "utils-eval.h"
 #include "utils-matrices.h"
 #include "statistics.h"
 #include "ranking.h"
+#include "cohort-io.h"
+#include "mask.h"
 
+#include <algorithm>
 #include <chrono>
-#include <numeric>
 #include <cmath>
+#include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <numeric>
+#include <set>
+#include <sstream>
+#include <string>
 
 using namespace lbcrypto;
 
-// Simple helper to measure runtime of a callable
 template <class F>
 auto timed(F&& f) {
     auto start = std::chrono::high_resolution_clock::now();
@@ -21,258 +42,290 @@ auto timed(F&& f) {
     return std::make_pair(t, res);
 }
 
-// Plaintext Pearson correlation
-static double pearsonPlain(const std::vector<double>& x, const std::vector<double>& y) {
-    double meanX = std::accumulate(x.begin(), x.end(), 0.0) / x.size();
-    double meanY = std::accumulate(y.begin(), y.end(), 0.0) / y.size();
-    double num = 0.0, denX = 0.0, denY = 0.0;
-    for (size_t i = 0; i < x.size(); ++i) {
-        double dx = x[i] - meanX;
-        double dy = y[i] - meanY;
-        num += dx * dy;
-        denX += dx * dx;
-        denY += dy * dy;
+static bool g_verbose = false;
+
+struct Party {
+    CryptoContext<DCRTPoly> cc;
+    KeyPair<DCRTPoly> keys;
+    size_t slots = 0;
+    bool bootstrap = false;
+};
+
+static Party makeParty(usint intBits, usint decBits, usint depth, size_t matrixSize, size_t slots,
+                       bool needMatrixKeys, bool bootstrap) {
+    Party p;
+    p.slots = slots;
+    p.bootstrap = bootstrap;
+    std::cout << "Generating single-party context (slots = " << slots << ", depth = " << depth
+              << (bootstrap ? " + bootstrapping" : "") << ")..." << std::endl;
+    p.cc = generateCryptoContext(intBits, decBits, depth, slots, bootstrap, 0, g_verbose);
+
+    std::set<int32_t> indexSet;
+    if (needMatrixKeys)
+        for (int32_t idx : getRotationIndices(matrixSize)) indexSet.insert(idx);
+    for (size_t i = 1; i < slots; i *= 2) {
+        indexSet.insert(static_cast<int32_t>(i));
+        indexSet.insert(-static_cast<int32_t>(i));
     }
-    return num / (std::sqrt(denX) * std::sqrt(denY));
+    std::vector<int32_t> indices(indexSet.begin(), indexSet.end());
+
+    if (g_verbose) {
+        // sizes for Table 7: a fresh ciphertext has 2*N*L words,
+        // a key-switching key 2*dnum*(L+|P|)*N words
+        const auto rnsParams = std::dynamic_pointer_cast<CryptoParametersRNS>(p.cc->GetCryptoParameters());
+        const size_t numQ = p.cc->GetCryptoParameters()->GetElementParams()->GetParams().size();
+        const size_t numP = (rnsParams->GetParamsP() ? rnsParams->GetParamsP()->GetParams().size() : 0);
+        const uint32_t dnum = rnsParams->GetNumPartQ();
+        const double mib = 1024.0 * 1024.0;
+        const double N = static_cast<double>(p.cc->GetRingDimension());
+        const size_t numKeys = 1 + indices.size();   // relinearisation + rotation keys
+        std::cout << "Ring dimension / CRT primes in Q / in P / dnum : " << p.cc->GetRingDimension() << " / " << numQ
+                  << " / " << numP << " / " << dnum << std::endl
+                  << "Fresh ciphertext (2 N L words)                 : " << 2.0 * N * numQ * 8.0 / mib << " MiB" << std::endl
+                  << "Evaluation keys (1 relin + " << indices.size() << " rotation)  : " << numKeys << " keys, about "
+                  << numKeys * 2.0 * dnum * (numQ + numP) * N * 8.0 / mib << " MiB of public material" << std::endl;
+    }
+
+    p.keys = keyGeneration(p.cc, indices, slots, bootstrap, g_verbose);
+    return p;
 }
 
-// Ciphertext Pearson correlation
-static double pearsonCtxt(const CryptoContext<DCRTPoly>& cc,
-                           const KeyPair<DCRTPoly>& keys,
-                           Ciphertext<DCRTPoly> xC,
-                           Ciphertext<DCRTPoly> yC,
-                           size_t n) {
-
-    auto meanXC = meanVector(cc, keys.publicKey, xC, n);
-    auto meanYC = meanVector(cc, keys.publicKey, yC, n);
-
-    auto xCen = centerVector(cc, keys.publicKey, xC, n);
-    auto yCen = centerVector(cc, keys.publicKey, yC, n);
-
-    auto xyC = dotProduct(cc, keys.publicKey, xCen, yCen, n);
-    xyC = sum (cc, keys.publicKey, xyC, n);
-    auto x2C = dotProduct(cc, keys.publicKey, xCen, xCen, n);
-    x2C = sum (cc, keys.publicKey, x2C, n);
-    auto y2C = dotProduct(cc, keys.publicKey, yCen, yCen, n);
-    y2C = sum (cc, keys.publicKey, y2C, n);
-
-    double u1 = 1.23; // or use random
-    double u2 = 2.34;
-    double u3 = u1 / u2;
-
-    auto maskedXdotY = cc->EvalMult(xyC, u1);
-    auto maskedLenX  = cc->EvalMult(x2C, u2*u2);
-    auto maskedLenY  = cc->EvalMult(y2C, u3*u3);
-
-    // After masking
-    double masked_dot = decryptScalar(cc, keys.secretKey, maskedXdotY);
-    double masked_x2  = decryptScalar(cc, keys.secretKey, maskedLenX);
-    double masked_y2  = decryptScalar(cc, keys.secretKey, maskedLenY);
-
-    double numerator   = masked_dot;
-    double denominator = std::sqrt(masked_x2) * std::sqrt(masked_y2);
-    double correction  = u1 / (u2 * u3);
-
-    return correction * numerator / denominator;
+static Ciphertext<DCRTPoly> encryptByCenter(const Party& p, const std::vector<double>& values,
+                                            const std::vector<int>& center, size_t numCenters) {
+    auto parts = splitByCenter(values, center, numCenters, p.slots);
+    Ciphertext<DCRTPoly> sum;
+    for (size_t c = 0; c < numCenters; ++c) {
+        Plaintext pt = p.cc->MakeCKKSPackedPlaintext(parts[c], 1, 0, nullptr, p.slots);
+        auto ct = p.cc->Encrypt(p.keys.publicKey, pt);
+        sum = (c == 0) ? ct : p.cc->EvalAdd(sum, ct);
+    }
+    return sum;
 }
 
-// Plaintext Wilcoxon rank-sum statistic (Z)
-static double wilcoxonPlain(const std::vector<double>& x, const std::vector<double>& g) {
-    auto ranks = rank(x); // fractional ranking
-    double S1 = 0.0;
-    double n1 = 0.0;
+static Plaintext indicatorPlaintext(const Party& p, size_t nEff) {
+    return p.cc->MakeCKKSPackedPlaintext(indicatorVector(nEff, p.slots), 1, 0, nullptr, p.slots);
+}
 
-    for (size_t i = 0; i < x.size(); ++i) {
-        if (g[i] > 0.5) {
-            S1 += ranks[i];
-            n1 += 1.0;
+static Ciphertext<DCRTPoly> sumFirst(const CryptoContext<DCRTPoly>& cc, Ciphertext<DCRTPoly> c, size_t length) {
+    auto s = c;
+    for (size_t i = 1; i < length; i *= 2) s = cc->EvalAdd(s, cc->EvalRotate(s, i));
+    return s;
+}
+
+static Ciphertext<DCRTPoly> sumAll(const Party& p, Ciphertext<DCRTPoly> c) {
+    return sumFirst(p.cc, c, p.slots);
+}
+
+static double dec(const Party& p, const Ciphertext<DCRTPoly>& c) {
+    return decryptScalar(p.cc, p.keys.secretKey, c);
+}
+
+// Pearson correlation (Section 3.4.1)
+static double pearsonCtxt(const Party& p, Ciphertext<DCRTPoly> xC, Ciphertext<DCRTPoly> yC,
+                          size_t nEff, const Plaintext& indP) {
+    auto cc = p.cc;
+    auto meanX = cc->EvalMult(sumAll(p, xC), 1.0 / static_cast<double>(nEff));
+    auto meanY = cc->EvalMult(sumAll(p, yC), 1.0 / static_cast<double>(nEff));
+    auto xCen = cc->EvalMult(cc->EvalSub(xC, meanX), indP);
+    auto yCen = cc->EvalMult(cc->EvalSub(yC, meanY), indP);
+
+    auto xyC = sumAll(p, cc->EvalMult(xCen, yCen));
+    auto x2C = sumAll(p, cc->EvalMult(xCen, xCen));
+    auto y2C = sumAll(p, cc->EvalMult(yCen, yCen));
+
+    // random masks; release covariance and variances (sums divided by n), 1/n cancels in r
+    const double u1 = sampleMask(), u2 = sampleMask(), u3 = u1 / u2;
+    const double invN = 1.0 / static_cast<double>(nEff);
+    const double m1 = dec(p, cc->EvalMult(xyC, u1 * invN));
+    const double m2 = dec(p, cc->EvalMult(x2C, u2 * u2 * invN));
+    const double m3 = dec(p, cc->EvalMult(y2C, u3 * u3 * invN));
+    if (g_verbose) {
+        std::ostringstream os;   // separate stream, so the format of cout is not changed
+        os << std::setprecision(6) << "    masked release (Pearson): " << m1 << ", " << m2 << ", " << m3
+           << "  ->  r = " << m1 / (std::sqrt(m2) * std::sqrt(m3));
+        std::cout << os.str() << std::endl;
+    }
+    return m1 / (std::sqrt(m2) * std::sqrt(m3));   // masks cancel: u1/(u2 u3) = 1
+}
+
+// Wilcoxon rank-sum (Section 3.4.2), same padding as in mpc-statistics.cpp
+static double wilcoxonCtxt(const Party& p, Ciphertext<DCRTPoly> xC, Ciphertext<DCRTPoly> gC,
+                           size_t nEff, size_t matrixSize, usint compareDepth) {
+    auto cc = p.cc;
+    // every row of the n x n layout holds the rank vector and gC is zero outside
+    // the first matrixSize slots, so we do not need to mask the other rows
+    Ciphertext<DCRTPoly> rankVec = rank(xC, matrixSize, -1.0, 1.0, depth2degree(compareDepth));
+    if (p.bootstrap) rankVec = cc->EvalBootstrap(rankVec);
+
+    auto s1C = sumFirst(cc, cc->EvalMult(rankVec, gC), matrixSize);
+    auto n1C = sumFirst(cc, gC, matrixSize);
+
+    const double n = static_cast<double>(nEff);
+    const double pad = static_cast<double>(matrixSize - nEff);
+    auto d1C = cc->EvalSub(s1C, cc->EvalMult(n1C, pad + (n + 1.0) / 2.0));
+    auto d2C = cc->EvalMult(cc->EvalMult(n1C, cc->EvalSub(n, n1C)), (n + 1.0) / 12.0);
+
+    // masked release (u D1/n^2, u^2 D2/n^4), the powers of n cancel in Z
+    const double u = sampleMask();
+    const double m1 = dec(p, cc->EvalMult(d1C, u / (n * n)));
+    const double m2 = dec(p, cc->EvalMult(d2C, u * u / (n * n * n * n)));
+    if (g_verbose) {
+        std::ostringstream os;
+        os << std::setprecision(6) << "    masked release (Wilcoxon): " << m1 << ", " << m2
+           << "  ->  z = " << m1 / std::sqrt(m2);
+        std::cout << os.str() << std::endl;
+    }
+    return m1 / std::sqrt(m2);
+}
+
+// Chi-squared (Section 3.4.3), closed form with one masked pair
+static double chi2Ctxt(const Party& p, Ciphertext<DCRTPoly> tC, Ciphertext<DCRTPoly> lC,
+                       size_t nEff, const Plaintext& indP) {
+    auto cc = p.cc;
+    auto notT = cc->EvalSub(indP, tC);
+    auto notL = cc->EvalSub(indP, lC);
+    auto aC = sumAll(p, cc->EvalMult(notT, notL));
+    auto bC = sumAll(p, cc->EvalMult(notT, lC));
+    auto cC = sumAll(p, cc->EvalMult(tC, notL));
+    auto dC = sumAll(p, cc->EvalMult(tC, lC));
+
+    // work with the proportions a/N, ... (see chi2MPC in mpc-statistics.cpp)
+    const double N = static_cast<double>(nEff);
+    const double invN = 1.0 / N;
+    auto paC = cc->EvalMult(aC, invN), pbC = cc->EvalMult(bC, invN);
+    auto pcC = cc->EvalMult(cC, invN), pdC = cc->EvalMult(dC, invN);
+    auto diff = cc->EvalSub(cc->EvalMult(paC, pdC), cc->EvalMult(pbC, pcC));   // level 3
+    auto sqC  = cc->EvalMult(diff, diff);                                        // level 4
+    auto qC   = cc->EvalMult(cc->EvalMult(cc->EvalAdd(paC, pbC), cc->EvalAdd(pcC, pdC)),
+                             cc->EvalMult(cc->EvalAdd(paC, pcC), cc->EvalAdd(pbC, pdC)));   // level 4
+
+    // masked release (v (ad-bc)^2/N^4, v r0 r1 c0 c1/N^4), the ratio is phi^2 = chi2 / N
+    const double v = sampleMask();
+    const double mP = dec(p, cc->EvalMult(sqC, v));
+    const double mQ = dec(p, cc->EvalMult(qC, v));
+    if (g_verbose) {
+        std::ostringstream os;
+        os << std::setprecision(6) << "    masked release (chi2): " << mP << ", " << mQ
+           << "  ->  chi2 = " << N * mP / mQ;
+        std::cout << os.str() << std::endl;
+    }
+    return N * mP / mQ;   // chi2 = N * phi^2, the mask cancels
+}
+
+struct Options {
+    size_t n = 512;
+    size_t runs = 50;
+    usint depth = 8;         // Pearson context, same as in mpc-statistics
+    usint intBits = 1;       // Pearson: 1+35 bits
+    usint decBits = 35;
+    usint chi2Depth = 5;     // chi-squared context
+    usint chi2IntBits = 10;  // chi-squared: 10+50 bits
+    usint chi2DecBits = 50;
+    usint compareDepth = 8;  // comparison depth of the ranking primitive
+    usint rankIntBits = 1;   // ranking: 1+40 bits
+    usint rankDecBits = 40;
+    std::string csv;
+    bool wilcoxon = true;
+    bool bootstrap = false;
+    bool verbose = false;
+};
+
+static void usage() {
+    std::cout << "usage: statistics-test [--n N] [--runs R] [--depth D] [--intbits I] [--decbits F]\n"
+                 "                       [--chi2-depth E] [--chi2-intbits I] [--chi2-decbits F]\n"
+                 "                       [--compare-depth C] [--rank-intbits I] [--rank-decbits F]\n"
+                 "                       [--csv FILE] [--no-wilcoxon] [--bootstrap] [--verbose]\n";
+}
+
+static Options parseArgs(int argc, char* argv[]) {
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        std::string a(argv[i]);
+        auto next = [&](const char* what) -> std::string {
+            if (i + 1 >= argc) { std::cerr << "missing value for " << what << std::endl; usage(); std::exit(2); }
+            return std::string(argv[++i]);
+        };
+        if (a == "--n") o.n = std::stoul(next("--n"));
+        else if (a == "--runs") o.runs = std::stoul(next("--runs"));
+        else if (a == "--depth") o.depth = static_cast<usint>(std::stoul(next("--depth")));
+        else if (a == "--chi2-depth") o.chi2Depth = static_cast<usint>(std::stoul(next("--chi2-depth")));
+        else if (a == "--chi2-intbits") o.chi2IntBits = static_cast<usint>(std::stoul(next("--chi2-intbits")));
+        else if (a == "--chi2-decbits") o.chi2DecBits = static_cast<usint>(std::stoul(next("--chi2-decbits")));
+        else if (a == "--compare-depth") o.compareDepth = static_cast<usint>(std::stoul(next("--compare-depth")));
+        else if (a == "--intbits") o.intBits = static_cast<usint>(std::stoul(next("--intbits")));
+        else if (a == "--decbits") o.decBits = static_cast<usint>(std::stoul(next("--decbits")));
+        else if (a == "--rank-intbits") o.rankIntBits = static_cast<usint>(std::stoul(next("--rank-intbits")));
+        else if (a == "--rank-decbits") o.rankDecBits = static_cast<usint>(std::stoul(next("--rank-decbits")));
+        else if (a == "--csv") o.csv = next("--csv");
+        else if (a == "--no-wilcoxon") o.wilcoxon = false;
+        else if (a == "--bootstrap") o.bootstrap = true;
+        else if (a == "--verbose") o.verbose = true;
+        else if (a == "-h" || a == "--help") { usage(); std::exit(0); }
+        else { std::cerr << "unknown argument: " << a << std::endl; usage(); std::exit(2); }
+    }
+    return o;
+}
+
+int main(int argc, char* argv[]) {
+    Options opt = parseArgs(argc, argv);
+    g_verbose = opt.verbose;
+
+    // one "center" in the single-party setting
+    Cohort cohort = opt.csv.empty() ? syntheticCohort(opt.n, 1) : loadCohortCsv(opt.csv, 1);
+
+    size_t maxN = 0;
+    for (const auto& a : cohort.analyses) maxN = std::max(maxN, a.nEff);
+    const size_t slots = nextPow2(maxN);
+    const bool runWilcoxon = opt.wilcoxon && slots <= 64;
+
+    std::cout << "Single-party FHE, " << (opt.csv.empty() ? "synthetic cohort" : "cohort file " + opt.csv)
+              << ", vector length " << slots << ", runs = " << opt.runs << std::endl;
+    if (opt.wilcoxon && !runWilcoxon)
+        std::cout << "Wilcoxon skipped: vector length " << slots << " exceeds the ranking primitive's limit (64)." << std::endl;
+
+    // one context per test: A Pearson, C chi-squared, B ranking
+    Party A = makeParty(opt.intBits, opt.decBits, opt.depth, slots, slots, false, false);
+    Party C = makeParty(opt.chi2IntBits, opt.chi2DecBits, opt.chi2Depth, slots, slots, false, false);
+    Party B;
+    if (runWilcoxon) {
+        usint depthB = opt.bootstrap ? opt.compareDepth : static_cast<usint>(opt.compareDepth + 4);
+        B = makeParty(opt.rankIntBits, opt.rankDecBits, depthB, slots, slots * slots, true, opt.bootstrap);
+    }
+
+    std::cout << std::fixed;
+    std::cout << "SUMMARY single-party slots=" << slots << " depth=" << opt.depth
+              << " bits=" << opt.intBits << "+" << opt.decBits
+              << " chi2-depth=" << opt.chi2Depth << " chi2-bits=" << opt.chi2IntBits << "+" << opt.chi2DecBits
+              << " compare-depth=" << opt.compareDepth
+              << " wilcoxon-depth=" << (runWilcoxon ? (opt.bootstrap ? opt.compareDepth : opt.compareDepth + 4) : 0)
+              << " rank-bits=" << opt.rankIntBits << "+" << opt.rankDecBits << std::endl;
+    for (const auto& a : cohort.analyses) {
+        if (a.kind == "wilcoxon" && !runWilcoxon) continue;
+        const Party& p = (a.kind == "wilcoxon") ? B : (a.kind == "chi2" ? C : A);
+
+        auto xC = encryptByCenter(p, padTo(a.x, slots), a.center, 1);
+        auto yC = encryptByCenter(p, padTo(a.y, slots), a.center, 1);
+        Plaintext indP = indicatorPlaintext(p, a.nEff);
+
+        double plain = (a.kind == "pearson") ? pearsonPlain(a.x, a.y)
+                     : (a.kind == "wilcoxon") ? wilcoxonPlain(a.x, a.y) : chi2Plain(a.x, a.y);
+
+        double total = 0.0, enc = 0.0;
+        for (size_t r = 0; r < opt.runs; ++r) {
+            std::pair<double, double> tr;
+            if (a.kind == "pearson")       tr = timed([&] { return pearsonCtxt(p, xC, yC, a.nEff, indP); });
+            else if (a.kind == "wilcoxon") tr = timed([&] { return wilcoxonCtxt(p, xC, yC, a.nEff, slots, opt.compareDepth); });
+            else                           tr = timed([&] { return chi2Ctxt(p, xC, yC, a.nEff, indP); });
+            total += tr.first;
+            enc = tr.second;
         }
+        double dev = (a.kind == "pearson") ? std::fabs(enc - plain) : 100.0 * std::fabs(enc - plain) / std::fabs(plain);
+        std::cout << "  " << std::left << std::setw(60) << a.name << std::right
+                  << " n=" << std::setw(4) << a.nEff
+                  << " plain=" << std::setw(10) << std::setprecision(4) << plain
+                  << " enc=" << std::setw(10) << std::setprecision(4) << enc
+                  << " dev=" << std::setw(8) << std::setprecision(4) << dev << (a.kind == "pearson" ? " (abs)" : " (%)  ")
+                  << " ms=" << std::setw(9) << std::setprecision(2) << 1000.0 * total / opt.runs << std::endl;
     }
-    double n0 = static_cast<double>(x.size()) - n1;
-    double U1 = S1 - ( n1 * (n1 + 1) ) / 2.0;
-    return (U1 - n0 * n1 / 2.0) / std::sqrt(n0 * n1 * (n0 + n1 + 1) / 12.0);
-}
-
-// Plaintext chi-squared for 2x2 contingency table
-static double chi2Plain(const std::vector<double>& t, const std::vector<double>& l) {
-    double a=0,b=0,c=0,d=0;
-    for (size_t i = 0; i < t.size(); ++i) {
-        a += (1 - t[i]) * (1 - l[i]);
-        b += (1 - t[i]) * l[i];
-        c += t[i] * (1 - l[i]);
-        d += t[i] * l[i];
-    }
-    double r0 = a + b;
-    double r1 = c + d;
-    double c0 = a + c;
-    double c1 = b + d;
-    double N  = r0 + r1;
-    double ea = r0 * c0 / N;
-    double eb = r0 * c1 / N;
-    double ec = r1 * c0 / N;
-    double ed = r1 * c1 / N;
-    return (std::pow(a-ea,2)/ea) + (std::pow(b-eb,2)/eb) +
-           (std::pow(c-ec,2)/ec) + (std::pow(d-ed,2)/ed);
-}
-
-// Ciphertext Wilcoxon rank-sum statistic
-static double wilcoxonCtxt(const CryptoContext<DCRTPoly>& cc,
-                           const KeyPair<DCRTPoly>& keys,
-                           Ciphertext<DCRTPoly> xC,
-                           Ciphertext<DCRTPoly> gC,
-                           size_t n,
-                           usint compareDepth) {
-    Ciphertext<DCRTPoly> rankC = rank(xC, n, -1.0, 1.0, depth2degree(compareDepth));
-    auto s1C = dotProduct(cc, keys.publicKey, rankC, gC, n);
-    auto n1C = sum(cc, keys.publicKey, gC, n);
-
-    double S1 = decryptScalar(cc, keys.secretKey, s1C);
-    double n1 = decryptScalar(cc, keys.secretKey, n1C);
-    double n0 = static_cast<double>(n) - n1;
-
-    auto minusOneC = cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(std::vector<double>(n, -1.0)));
-
-    // Encrypt the size n as a vector filled with n
-    std::vector<double> sizeVector(n, static_cast<double>(n));
-    auto sizeC = cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(sizeVector));
-
-    auto minusn1C = cc->EvalMult(n1C, minusOneC);
-    auto n0C = cc->EvalAdd(sizeC, minusn1C);
-
-    double U1 = S1 - (n1 * (n1 + 1) ) / 2.0;
-    return (U1 - (n0 * n1 ) / 2.0) / std::sqrt((n0 * n1 * (n0 + n1 + 1) ) / 12.0);
-}
-
-// Ciphertext chi-squared
-static double chi2Ctxt(const CryptoContext<DCRTPoly>& cc,
-                       const KeyPair<DCRTPoly>& keys,
-                       Ciphertext<DCRTPoly> tC,
-                       Ciphertext<DCRTPoly> lC,
-                       Ciphertext<DCRTPoly> oneC,
-                       size_t n) {
-    auto aC = sum(cc, keys.publicKey, (oneC - tC) * (oneC - lC), n);
-    auto bC = sum(cc, keys.publicKey, (oneC - tC) * lC, n);
-    auto cC = sum(cc, keys.publicKey, tC * (oneC - lC), n);
-    auto dC = sum(cc, keys.publicKey, tC * lC, n);
-
-    auto r0C = aC + bC;
-    auto r1C = cC + dC;
-    auto c0C = aC + cC;
-    auto c1C = bC + dC;
-    auto nC = aC+bC+cC+dC;
-
-    std::vector<double> sizeVector(n, static_cast<double>(1.0/n));
-    auto onedivdedbysizeVector = cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(sizeVector));
-
-    double a = decryptScalar(cc, keys.secretKey, aC);
-    double b = decryptScalar(cc, keys.secretKey, bC);
-    double c = decryptScalar(cc, keys.secretKey, cC);
-    double d = decryptScalar(cc, keys.secretKey, dC);
-
-    double r0 = a + b;
-    double r1 = c + d;
-    double c0 = a + c;
-    double c1 = b + d;
-    double N  = r0 + r1;
-
-    double ea = r0 * c0 / N;
-    double eb = r0 * c1 / N;
-    double ec = r1 * c0 / N;
-    double ed = r1 * c1 / N;
-    return (std::pow(a-ea,2)/ea) + (std::pow(b-eb,2)/eb) +
-           (std::pow(c-ec,2)/ec) + (std::pow(d-ed,2)/ed);
-}
-
-int main() {
-    // Sample data
-    std::vector<double> x  = {0.2, 0.4, 0.6, 0.8};
-    std::vector<double> y  = {0.1, 0.5, 0.3, 0.9};
-
-    std::vector<double> g = { 1,0,1,0};
-
-    std::vector<double> t  = {0, 0, 1, 1};
-    std::vector<double> l  = {0, 1, 0, 1};
-
-    const size_t n = x.size();
-    const usint compareDepth = 3;
-    const size_t runs = 50; // battery size
-    const size_t slots = n;
-    std::cout<<"generating context..."<<std::endl;
-    CryptoContext<DCRTPoly> cc = generateCryptoContext(
-        1, 20, compareDepth , slots, false, 0, true);
-
-    std::cout<<"context generated"<<std::endl;
-
-    std::vector<int32_t> indices = getRotationIndices(n);
-    std::cout<<"generating keys..."<<std::endl;
-    KeyPair<DCRTPoly> keys = keyGeneration(cc, indices, slots, false, true);
-
-    auto enc = [&](const std::vector<double>& v){
-        Plaintext pt = cc->MakeCKKSPackedPlaintext(v, 1, 0, nullptr, slots);
-        return cc->Encrypt(keys.publicKey, pt);
-    };
-
-    Ciphertext<DCRTPoly> xC = enc(x);
-    Ciphertext<DCRTPoly> yC = enc(y);
-    Ciphertext<DCRTPoly> gC = enc(g);
-    Ciphertext<DCRTPoly> tC = enc(t);
-    Ciphertext<DCRTPoly> lC = enc(l);
-    std::vector<double> ones(n,1.0);
-    Ciphertext<DCRTPoly> oneC = enc(ones);
-
-    auto [ent, rpt] = timed([&]() {
-        auto encOne = cc->Encrypt(keys.publicKey, cc->MakeCKKSPackedPlaintext(std::vector<double>(n, 1.0)));
-        return encOne;
-    });
-    std::cout<<"encryption time: "<<ent*1000<<"ms"<<std::endl;
-
-    std::cout<<"Number of values: "<<n<<std::endl;
-
-    // Pearson
-    double tPlain=0, tCtxt=0, resPlain=0, resCtxt=0;
-
-    for(size_t i=0;i<runs;i++) {
-        auto [tp, rp] = timed([&]{ return pearsonPlain(x,y); });
-        tPlain += tp; resPlain = rp;
-        auto [tc, rc] = timed([&]{ return pearsonCtxt(cc, keys, xC, yC, n); });
-        tCtxt += tc; resCtxt = rc;
-    }
-    std::cout << "Pearson plaintext result: " << resPlain
-              << " avg time: " << (tPlain / runs) * 1000 << "ms" << std::endl;
-    std::cout << "Pearson ciphertext result: " << resCtxt
-              << " avg time: " << (tCtxt / runs) * 1000 << "ms" << std::endl;
-
-    std::cout<<std::endl<<std::endl;
-    return 0;
-
-    // Wilcoxon
-    tPlain=tCtxt=0; resPlain=resCtxt=0;
-    for(size_t i=0;i<runs;i++) {
-        auto [tp, rp] = timed([&]{ return wilcoxonPlain(x,g); });
-        tPlain += tp; resPlain = rp;
-        auto [tc, rc] = timed([&]{ return wilcoxonCtxt(cc, keys, xC, gC, n, compareDepth); });
-        tCtxt += tc; resCtxt = rc;
-    }
-    std::cout << "Wilcoxon plaintext Z: " << resPlain
-              << " avg time: " << (tPlain / runs) * 1000 << "ms" << std::endl;
-    std::cout << "Wilcoxon ciphertext Z: " << resCtxt
-              << " avg time: " << (tCtxt / runs) * 1000 << "ms" << std::endl;
-
-    std::cout<<std::endl<<std::endl;
-
-    // Chi-squared
-    tPlain=tCtxt=0; resPlain=resCtxt=0;
-    for(size_t i=0;i<runs;i++) {
-        auto [tp, rp] = timed([&]{ return chi2Plain(t,l); });
-        tPlain += tp; resPlain = rp;
-        auto [tc, rc] = timed([&]{ return chi2Ctxt(cc, keys, tC, lC, oneC, n); });
-        tCtxt += tc; resCtxt = rc;
-    }
-
-    std::cout << "Chi-squared plaintext: " << resPlain
-              << " avg time: " << (tPlain / runs) * 1000 << "ms" << std::endl;
-    std::cout << "Chi-squared ciphertext: " << resCtxt
-              << " avg time: " << (tCtxt / runs) * 1000 << "ms" << std::endl;
-
     return 0;
 }

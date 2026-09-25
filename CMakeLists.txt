@@ -110,6 +110,7 @@ add_executable( statistics-test
                                         src/utils-ptxt.cpp
                                         src/ranking.cpp
                                         src/statistics.cpp
+                                        src/cohort-io.cpp
                                         src/test-statistics.cpp
                                 )
 
@@ -121,5 +122,6 @@ add_executable( mpc-statistics
                                         src/ranking.cpp
                                         src/ranking-mpc.cpp
                                         src/statistics.cpp
+                                        src/cohort-io.cpp
                                         src/mpc-statistics.cpp
                                 )
